@@ -10,6 +10,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bees-codegen"
+version = "0.1.0"
+dependencies = [
+ "bees",
+]
+
+[[package]]
 name = "bees-macro"
 version = "0.1.0"
 dependencies = [

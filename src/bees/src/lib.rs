@@ -151,6 +151,7 @@ pub mod subfield_internals {
 
     pub use std::ptr::{addr_of_mut, NonNull};
 
+    #[inline(always)]
     pub fn get_func_disambiguator() -> FuncDisambiguator {
         FuncDisambiguator
     }

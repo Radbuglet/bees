@@ -1,2 +1,2 @@
 [workspace]
-members = ["src/bees", "src/bees-macro"]
+members = ["src/bees", "src/bees-macro", "src/codegen"]
