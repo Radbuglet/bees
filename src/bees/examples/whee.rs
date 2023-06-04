@@ -1,4 +1,4 @@
-use bees::Struct;
+use bees::{Ptr, Struct};
 
 #[derive(Struct)]
 pub struct LinkedList<T> {
@@ -44,4 +44,28 @@ impl<T> LinkedListRef<T> {
     }
 }
 
-fn main() {}
+fn main() {
+    let elem_1 = Ptr::alloc();
+    elem_1.write_new(LinkedList {
+        value: 1,
+        left: None,
+        right: None,
+    });
+
+    let elem_2 = Ptr::alloc();
+    elem_2.write_new(LinkedList {
+        value: 2,
+        left: None,
+        right: None,
+    });
+
+    let elem_3 = Ptr::alloc();
+    elem_3.write_new(LinkedList {
+        value: 3,
+        left: None,
+        right: None,
+    });
+
+    elem_2.as_wide_ref().insert_after(elem_1.as_wide_ref());
+	elem_3.as_wide_ref().insert_after(elem_2.as_wide_ref());
+}
