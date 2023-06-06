@@ -1,116 +1,90 @@
 use std::{
-    cell::Cell,
-    mem::{self, MaybeUninit},
-    num::NonZeroU64,
-    ptr::{addr_of_mut, NonNull},
+    cell::{Cell, RefCell},
+    marker::PhantomData,
+    ptr::null_mut,
 };
 
-// === Gen Allocation === //
+// === Slot Manager === //
 
-pub fn alloc_gen() -> NonZeroU64 {
-    thread_local! {
-        static GEN: Cell<NonZeroU64> = const {
-            Cell::new(match NonZeroU64::new(GEN_ENTITY_MIN) {
-                Some(val) => val,
-                None => unreachable!(),
-            })
-        };
-    }
+struct Slot {
+    gen: Cell<u64>,
+    data: Cell<*mut ()>,
+}
 
-    GEN.with(|v| {
-        let id = v.get();
-        v.set(id.checked_add(1).expect("too many IDs"));
-        id
+thread_local! {
+    static FREE_SLOTS: RefCell<Vec<&'static Slot>> = RefCell::new(Vec::new());
+}
+
+fn alloc_slot() -> &'static Slot {
+    FREE_SLOTS.with(|slots| {
+        let slots = &mut *slots.borrow_mut();
+
+        if let Some(slot) = slots.pop() {
+            slot
+        } else {
+            slots.extend(
+                Box::leak(Box::from_iter((0..128).map(|_| Slot {
+                    gen: Cell::new(0),
+                    data: Cell::new(null_mut()),
+                })))
+                .iter(),
+            );
+
+            slots.pop().unwrap()
+        }
     })
 }
 
-// === AllocationSlot === //
+fn dealloc_slot(slot: &'static Slot) {
+    FREE_SLOTS.with(|slots| slots.borrow_mut().push(slot));
+}
+
+// === Ref === //
 
 const DANGLING_ERR: &str = "attempted to deref a dead pointer";
 
-#[repr(C)]
-struct AllocationSlotVirtual<T: ?Sized> {
+pub struct Ref<T> {
+    _ty: PhantomData<*const T>,
     gen: u64,
-    value: T,
+    slot: &'static Slot,
+    offset: usize,
 }
 
-// === Ptr === //
-
-const GEN_NONE: u64 = 0;
-const GEN_ALLOCATED: u64 = 1;
-const GEN_NEVER: u64 = 2;
-const GEN_ENTITY_MIN: u64 = 3;
-
-pub struct Ptr<T: ?Sized> {
-    // Invariants: This must always point to a readable `u64`. If `gen` is non-zero, this value is
-    // writable. If `gen` is neither zero nor one, this points to a readable and writable
-    // `AllocationSlotVirtual<T>`.
-    data: NonNull<AllocationSlotVirtual<T>>,
-}
-
-impl<T: ?Sized> Ptr<T> {
-    // === Allocation === //
-
-    #[inline(always)]
-    pub fn alloc() -> Self
-    where
-        T: Sized,
-    {
-        #[repr(C)]
-        struct AllocationSlot<T> {
-            _gen: u64,
-            _value: MaybeUninit<T>,
-        }
+impl<T> Ref<T> {
+    pub fn new(value: T) -> Self {
+        let value = Box::new(value);
+        let slot = alloc_slot();
+        slot.gen.set(slot.gen.get() + 1);
+        slot.data.set(Box::leak(value) as *mut T as *mut ());
 
         Self {
-            data: NonNull::from(Box::leak(Box::new(AllocationSlot::<T> {
-                _gen: GEN_ALLOCATED,
-                _value: MaybeUninit::uninit(),
-            })))
-            .cast(),
+            _ty: PhantomData,
+            gen: slot.gen.get(),
+            slot,
+            offset: 0,
         }
     }
 
     #[inline(always)]
-    pub fn dealloc(self) {
-        todo!()
-    }
-
-    // === Generation queries === //
-
-    #[inline(always)]
-    fn gen_ptr(self) -> NonNull<u64> {
-        self.data.cast::<u64>()
+    pub fn is_alive(self) -> bool {
+        self.gen == self.slot.gen.get()
     }
 
     #[inline(always)]
-    pub fn gen(self) -> u64 {
-        unsafe { *self.gen_ptr().as_ptr() }
+    pub fn get_unchecked(self) -> *mut T {
+        unsafe {
+            self.slot
+                .data
+                .get()
+                .cast::<u8>()
+                .add(self.offset)
+                .cast::<T>()
+        }
     }
 
     #[inline(always)]
-    unsafe fn set_gen(self, gen: u64) {
-        unsafe { *self.gen_ptr().as_ptr() = gen };
-    }
-
-    #[inline(always)]
-    pub fn get_unchecked(self) -> NonNull<T> {
-        unsafe { NonNull::new(addr_of_mut!((*self.data.as_ptr()).value)).unwrap_unchecked() }
-    }
-
-    #[inline(always)]
-    pub fn is_allocated(self) -> bool {
-        self.gen() != GEN_NONE
-    }
-
-    #[inline(always)]
-    pub fn is_allocated_and_init(self) -> bool {
-        self.gen() >= GEN_ENTITY_MIN
-    }
-
-    #[inline(always)]
-    pub fn try_get(self) -> Option<NonNull<T>> {
-        if self.is_allocated_and_init() {
+    pub fn try_get(self) -> Option<*mut T> {
+        if self.is_alive() {
             Some(self.get_unchecked())
         } else {
             None
@@ -118,143 +92,8 @@ impl<T: ?Sized> Ptr<T> {
     }
 
     #[inline(always)]
-    pub fn get(self) -> NonNull<T> {
+    pub fn get(self) -> *mut T {
         self.try_get().expect(DANGLING_ERR)
-    }
-
-    // === Pointer management === //
-
-    #[inline(always)]
-    pub fn write_new(self, value: T) -> Option<T>
-    where
-        T: Sized,
-    {
-        self.write(alloc_gen(), value)
-    }
-
-    #[inline(always)]
-    pub fn write(self, gen: NonZeroU64, value: T) -> Option<T>
-    where
-        T: Sized,
-    {
-        debug_assert_ne!(gen.get(), GEN_ALLOCATED);
-
-        // Ensure that this ptr has a backing allocation and write the value to it
-        let value = match self.gen() {
-            0 => panic!("attempted to initialize un-allocated Ptr"),
-            1 => unsafe {
-                self.get_unchecked().as_ptr().write(value);
-                None
-            },
-            _ => Some(unsafe { mem::replace(self.get_unchecked().as_mut(), value) }),
-        };
-
-        // Update the generation
-        unsafe { self.set_gen(gen.get()) };
-
-        value
-    }
-
-    #[inline(always)]
-    pub fn take(self) -> Option<T>
-    where
-        T: Sized,
-    {
-        if self.is_allocated_and_init() {
-            // Mark this slot as allocated but empty.
-            unsafe { self.set_gen(GEN_ALLOCATED) };
-
-            // Take the value from the slot, leaving it uninitialized.
-            let value = unsafe { self.get_unchecked().as_ptr().read() };
-            Some(value)
-        } else {
-            None
-        }
-    }
-
-    #[inline(always)]
-    #[must_use]
-    pub fn try_destroy(self) -> bool {
-        if self.is_allocated_and_init() {
-            // Mark this slot as allocated but empty. This happens first because `drop_in_place`
-            // calls out to user code.
-            unsafe { self.set_gen(GEN_ALLOCATED) };
-
-            // Drop the value in the slot without moving it, leaving it uninitialized.
-            unsafe { self.get_unchecked().as_ptr().drop_in_place() };
-
-            true
-        } else {
-            false
-        }
-    }
-
-    #[inline(always)]
-    pub fn destroy(self) {
-        assert!(self.try_destroy(), "{DANGLING_ERR}");
-    }
-
-    #[inline(always)]
-    pub fn as_wide_ref_prim(self) -> WideRef<T> {
-        WideRef {
-            gen: NonZeroU64::new(self.gen()).unwrap_or(NonZeroU64::new(GEN_NEVER).unwrap()),
-            slot: self.gen_ptr(),
-            data: self.get_unchecked(),
-        }
-    }
-
-    #[inline(always)]
-    pub fn as_wide_ref(self) -> T::WideWrapper
-    where
-        T: Struct,
-    {
-        WideWrapper::from_raw(self.as_wide_ref_prim())
-    }
-}
-
-impl<T: ?Sized> Copy for Ptr<T> {}
-
-impl<T: ?Sized> Clone for Ptr<T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-// === WideRef === //
-
-pub struct WideRef<T: ?Sized> {
-    gen: NonZeroU64,
-
-    // Invariants: This pointer is always readable. If `*slot == gen`, `data` is valid.
-    slot: NonNull<u64>,
-
-    // Invariants: This pointer has read and write access to its target if valid.
-    data: NonNull<T>,
-}
-
-impl<T: ?Sized> WideRef<T> {
-    #[inline(always)]
-    pub fn is_alive(self) -> bool {
-        unsafe { *self.slot.as_ptr() == self.gen.get() }
-    }
-
-    #[inline(always)]
-    pub fn try_get(self) -> Option<NonNull<T>> {
-        if self.is_alive() {
-            Some(self.data)
-        } else {
-            None
-        }
-    }
-
-    #[inline(always)]
-    pub fn get(self) -> NonNull<T> {
-        self.try_get().expect(DANGLING_ERR)
-    }
-
-    #[inline(always)]
-    pub fn get_unchecked(self) -> NonNull<T> {
-        self.data
     }
 
     #[inline(always)]
@@ -263,7 +102,7 @@ impl<T: ?Sized> WideRef<T> {
         T: Copy,
     {
         if let Some(ptr) = self.try_get() {
-            Some(unsafe { ptr.as_ptr().read() })
+            Some(unsafe { ptr.read() })
         } else {
             None
         }
@@ -283,8 +122,8 @@ impl<T: ?Sized> WideRef<T> {
         T: Sized,
     {
         if let Some(ptr) = self.try_get() {
-            let read = unsafe { ptr.as_ptr().read() };
-            unsafe { ptr.as_ptr().write(value) };
+            let read = unsafe { ptr.read() };
+            unsafe { ptr.write(value) };
             Some(read)
         } else {
             None
@@ -300,23 +139,31 @@ impl<T: ?Sized> WideRef<T> {
     }
 
     #[inline(always)]
-    pub unsafe fn subfield_unchecked<U: ?Sized>(self, data: NonNull<U>) -> WideRef<U> {
-        WideRef {
+    pub unsafe fn subfield_unchecked<U>(self, data: *mut U) -> Ref<U> {
+        Ref {
+            _ty: PhantomData,
             gen: self.gen,
             slot: self.slot,
-            data,
+            offset: data as usize - self.slot.data.get() as usize,
         }
     }
 
     #[inline(always)]
-    pub fn get_for_macro(self, _: FuncDisambiguator) -> (Self, NonNull<T>) {
+    pub fn get_for_macro(self, _: FuncDisambiguator) -> (Self, *mut T) {
         (self, self.get())
+    }
+
+    pub fn wrap(self) -> T::Wrapper
+    where
+        T: Struct,
+    {
+        RefWrapper::from_raw(self)
     }
 }
 
-impl<T: ?Sized> Copy for WideRef<T> {}
+impl<T> Copy for Ref<T> {}
 
-impl<T: ?Sized> Clone for WideRef<T> {
+impl<T> Clone for Ref<T> {
     fn clone(&self) -> Self {
         *self
     }
@@ -328,7 +175,6 @@ macro_rules! subfield {
         let (target, ptr) =
             $target.get_for_macro($crate::subfield_internals::get_func_disambiguator());
 
-        let ptr = ptr.as_ptr();
         let ptr = unsafe {
             // Safety: this is a valid pointer to some data.
             $crate::subfield_internals::addr_of_mut!((*ptr).$field)
@@ -336,9 +182,7 @@ macro_rules! subfield {
 
         unsafe {
             // Safety: this field will not expire until the parent structure has expired.
-            target.subfield_unchecked(
-                $crate::subfield_internals::NonNull::new(ptr).unwrap_unchecked(),
-            )
+            target.subfield_unchecked(ptr)
         }
     }};
 }
@@ -347,7 +191,7 @@ macro_rules! subfield {
 pub mod subfield_internals {
     use super::*;
 
-    pub use std::ptr::{addr_of_mut, NonNull};
+    pub use std::ptr::addr_of_mut;
 
     #[inline(always)]
     pub fn get_func_disambiguator() -> FuncDisambiguator {
@@ -364,15 +208,15 @@ pub(crate) use func_disambiguator_sealed::FuncDisambiguator;
 // === Struct === //
 
 pub trait Struct {
-    type WideWrapper: WideWrapper<Pointee = Self>;
+    type Wrapper: RefWrapper<Pointee = Self>;
 }
 
-pub trait WideWrapper: Copy {
-    type Pointee: ?Sized;
+pub trait RefWrapper: Copy {
+    type Pointee;
 
-    fn from_raw(raw: WideRef<Self::Pointee>) -> Self;
+    fn from_raw(raw: Ref<Self::Pointee>) -> Self;
 
-    fn raw(self) -> WideRef<Self::Pointee>;
+    fn raw(self) -> Ref<Self::Pointee>;
 }
 
 // === Macros === //

@@ -97,19 +97,19 @@ pub fn derive_struct(input: NativeTokenStream) -> NativeTokenStream {
                 Ident::new(&format!("{method_name_base}_ref"), method_name_base.span());
 
             quote! {
-                #vis fn #method_name_prim_ref(&self) -> #crate_::WideRef<#ty>
+                #vis fn #method_name_prim_ref(&self) -> #crate_::Ref<#ty>
                 where
                     for<'__trivial> <#ty as #crate_internal::TrivialBound<'__trivial>>::Itself: Sized,
                 {
                     #crate_::subfield!(self.0, #field_name)
                 }
 
-				#vis fn #method_name_ref<__WideRefOut>(&self) -> __WideRefOut
+				#vis fn #method_name_ref<__RefOut>(&self) -> __RefOut
                 where
-                    for<'__trivial> <#ty as #crate_internal::TrivialBound<'__trivial>>::Itself: Sized + #crate_::Struct<WideWrapper = __WideRefOut>,
-					__WideRefOut: #crate_::WideWrapper<Pointee = #ty>,
+                    for<'__trivial> <#ty as #crate_internal::TrivialBound<'__trivial>>::Itself: Sized + #crate_::Struct<Wrapper = __RefOut>,
+					__RefOut: #crate_::RefWrapper<Pointee = #ty>,
                 {
-                    #crate_::WideWrapper::from_raw(self.#method_name_prim_ref())
+                    #crate_::RefWrapper::from_raw(self.#method_name_prim_ref())
                 }
 
                 #vis fn #method_name_get(&self) -> #ty
@@ -130,7 +130,7 @@ pub fn derive_struct(input: NativeTokenStream) -> NativeTokenStream {
         .collect::<Vec<_>>();
 
     let output = quote! {
-        #vis struct #wrapper_name<#(#generic_in_list),*>(#crate_::WideRef<#base_name<#(#generic_fwd_list),*>>)
+        #vis struct #wrapper_name<#(#generic_in_list),*>(#crate_::Ref<#base_name<#(#generic_fwd_list),*>>)
         #where_clause;
 
         impl<#(#generic_in_list),*> #crate_internal::Copy for #wrapper_name<#(#generic_fwd_list),*>
@@ -148,19 +148,19 @@ pub fn derive_struct(input: NativeTokenStream) -> NativeTokenStream {
         impl<#(#generic_in_list),*> #crate_::Struct for #base_name<#(#generic_fwd_list),*>
         #where_clause
         {
-            type WideWrapper = #wrapper_name<#(#generic_fwd_list),*>;
+            type Wrapper = #wrapper_name<#(#generic_fwd_list),*>;
         }
 
-        impl<#(#generic_in_list),*> #crate_::WideWrapper for #wrapper_name<#(#generic_fwd_list),*>
+        impl<#(#generic_in_list),*> #crate_::RefWrapper for #wrapper_name<#(#generic_fwd_list),*>
         #where_clause
         {
             type Pointee = #base_name<#(#generic_fwd_list),*>;
 
-            fn from_raw(raw: #crate_::WideRef<Self::Pointee>) -> Self {
+            fn from_raw(raw: #crate_::Ref<Self::Pointee>) -> Self {
                 Self(raw)
             }
 
-            fn raw(self) -> #crate_::WideRef<Self::Pointee> {
+            fn raw(self) -> #crate_::Ref<Self::Pointee> {
                 self.0
             }
         }
