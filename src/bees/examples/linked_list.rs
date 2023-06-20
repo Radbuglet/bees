@@ -1,7 +1,7 @@
-use bees::{Ref, Struct};
+use bees::{Allocation, Struct};
 
 #[derive(Struct)]
-pub struct LinkedList<T> {
+pub struct LinkedList<T: 'static> {
     value: T,
     left: Option<LinkedListRef<T>>,
     right: Option<LinkedListRef<T>>,
@@ -45,23 +45,33 @@ impl<T> LinkedListRef<T> {
 }
 
 fn main() {
-    let elem_1 = Ref::new(LinkedList {
-        value: 1,
-        left: None,
-        right: None,
-    });
+    let alloc = Allocation::new(3);
+    let elem_1 = alloc.put(
+        0,
+        LinkedList {
+            value: 1,
+            left: None,
+            right: None,
+        },
+    );
 
-    let elem_2 = Ref::new(LinkedList {
-        value: 2,
-        left: None,
-        right: None,
-    });
+    let elem_2 = alloc.put(
+        1,
+        LinkedList {
+            value: 2,
+            left: None,
+            right: None,
+        },
+    );
 
-    let elem_3 = Ref::new(LinkedList {
-        value: 3,
-        left: None,
-        right: None,
-    });
+    let elem_3 = alloc.put(
+        2,
+        LinkedList {
+            value: 3,
+            left: None,
+            right: None,
+        },
+    );
 
     elem_2.wrap().insert_after(elem_1.wrap());
     elem_3.wrap().insert_after(elem_2.wrap());

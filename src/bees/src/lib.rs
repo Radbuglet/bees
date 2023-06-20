@@ -1,85 +1,150 @@
 use std::{
-    cell::{Cell, RefCell},
-    marker::PhantomData,
-    ptr::null_mut,
+    cell::{Cell, UnsafeCell},
+    mem::MaybeUninit,
+    num::NonZeroU64,
+    sync::atomic::{AtomicU64, Ordering::Relaxed},
 };
 
-// === Slot Manager === //
+// === Arena === //
 
-struct Slot {
-    gen: Cell<u64>,
-    data: Cell<*mut ()>,
+fn gen() -> NonZeroU64 {
+    static GEN: AtomicU64 = AtomicU64::new(1);
+    NonZeroU64::new(GEN.fetch_add(1, Relaxed)).unwrap()
 }
 
-thread_local! {
-    static FREE_SLOTS: RefCell<Vec<&'static Slot>> = RefCell::new(Vec::new());
+pub struct Allocation<T: 'static> {
+    values: &'static [Generational<T>],
 }
 
-fn alloc_slot() -> &'static Slot {
-    FREE_SLOTS.with(|slots| {
-        let slots = &mut *slots.borrow_mut();
-
-        if let Some(slot) = slots.pop() {
-            slot
-        } else {
-            slots.extend(
-                Box::leak(Box::from_iter((0..128).map(|_| Slot {
-                    gen: Cell::new(0),
-                    data: Cell::new(null_mut()),
-                })))
-                .iter(),
-            );
-
-            slots.pop().unwrap()
+impl<T> Allocation<T> {
+    pub fn new(len: usize) -> Self {
+        Self {
+            values: Box::leak(Box::from_iter((0..len).map(|_| Generational::new_empty()))),
         }
-    })
+    }
+
+    pub fn put_with_gen(&self, index: usize, gen: NonZeroU64, value: T) -> Ref<T> {
+        let slot = &self.values[index];
+        unsafe { slot.replace(Some((gen, value))) };
+
+        Ref {
+            gen,
+            gen_ptr: &slot.gen,
+            value: slot.get(),
+        }
+    }
+
+    pub fn put(&self, index: usize, value: T) -> Ref<T> {
+        self.put_with_gen(index, gen(), value)
+    }
+
+    pub fn try_get(&self, index: usize) -> Option<Ref<T>> {
+        let slot = &self.values[index];
+
+        if slot.is_full() {
+            Some(Ref {
+                gen: NonZeroU64::new(slot.gen.get()).unwrap(),
+                gen_ptr: &slot.gen,
+                value: slot.get(),
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn get(&self, index: usize) -> Ref<T> {
+        self.try_get(index).unwrap()
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
 }
 
-fn dealloc_slot(slot: &'static Slot) {
-    FREE_SLOTS.with(|slots| slots.borrow_mut().push(slot));
+struct Generational<T> {
+    gen: Cell<u64>,
+    value: UnsafeCell<MaybeUninit<T>>,
+}
+
+impl<T> Generational<T> {
+    pub fn new(value: Option<(NonZeroU64, T)>) -> Self {
+        match value {
+            Some((gen, value)) => Self::new_full(gen, value),
+            None => Self::new_empty(),
+        }
+    }
+
+    pub const fn new_empty() -> Self {
+        Self {
+            gen: Cell::new(0),
+            value: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+
+    pub const fn new_full(gen: NonZeroU64, value: T) -> Self {
+        Self {
+            gen: Cell::new(gen.get()),
+            value: UnsafeCell::new(MaybeUninit::new(value)),
+        }
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.gen.get() != 0
+    }
+
+    pub fn get(&self) -> *mut T {
+        self.value.get() as *mut T
+    }
+
+    pub fn get_mut(&mut self) -> Option<&mut T> {
+        if self.is_full() {
+            Some(unsafe { self.value.get_mut().assume_init_mut() })
+        } else {
+            None
+        }
+    }
+
+    pub unsafe fn replace(&self, value: Option<(NonZeroU64, T)>) -> Option<T> {
+        let old = if self.is_full() {
+            Some(unsafe { self.get().read() })
+        } else {
+            None
+        };
+
+        if let Some((gen, value)) = value {
+            self.gen.set(gen.get());
+            self.get().write(value);
+        }
+
+        old
+    }
+}
+
+impl<T> Drop for Generational<T> {
+    fn drop(&mut self) {
+        if self.is_full() {}
+    }
 }
 
 // === Ref === //
 
 const DANGLING_ERR: &str = "attempted to deref a dead pointer";
 
-pub struct Ref<T> {
-    _ty: PhantomData<*const T>,
-    gen: u64,
-    slot: &'static Slot,
-    offset: usize,
+pub struct Ref<T: 'static> {
+    gen_ptr: &'static Cell<u64>,
+    gen: NonZeroU64,
+    value: *mut T,
 }
 
 impl<T> Ref<T> {
-    pub fn new(value: T) -> Self {
-        let value = Box::new(value);
-        let slot = alloc_slot();
-        slot.gen.set(slot.gen.get() + 1);
-        slot.data.set(Box::leak(value) as *mut T as *mut ());
-
-        Self {
-            _ty: PhantomData,
-            gen: slot.gen.get(),
-            slot,
-            offset: 0,
-        }
-    }
-
     #[inline(always)]
     pub fn is_alive(self) -> bool {
-        self.gen == self.slot.gen.get()
+        self.gen.get() == self.gen_ptr.get()
     }
 
     #[inline(always)]
     pub fn get_unchecked(self) -> *mut T {
-        unsafe {
-            self.slot
-                .data
-                .get()
-                .cast::<u8>()
-                .add(self.offset)
-                .cast::<T>()
-        }
+        self.value
     }
 
     #[inline(always)]
@@ -141,10 +206,9 @@ impl<T> Ref<T> {
     #[inline(always)]
     pub unsafe fn subfield_unchecked<U>(self, data: *mut U) -> Ref<U> {
         Ref {
-            _ty: PhantomData,
+            gen_ptr: self.gen_ptr,
             gen: self.gen,
-            slot: self.slot,
-            offset: data as usize - self.slot.data.get() as usize,
+            value: data,
         }
     }
 
@@ -204,6 +268,20 @@ mod func_disambiguator_sealed {
 }
 
 pub(crate) use func_disambiguator_sealed::FuncDisambiguator;
+
+// === MovableRef === //
+
+pub struct MovableRef<T> {
+    gen_ptr: &'static Cell<u64>,
+    gen: NonZeroU64,
+    value: Cell<*mut T>,
+}
+
+// TODO: Implement `MovableRef`
+
+// === ThinRef === //
+
+// TODO: Implement `ThinRef`
 
 // === Struct === //
 
