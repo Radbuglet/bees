@@ -38,6 +38,10 @@ impl<T> Allocation<T> {
         self.put_with_gen(index, gen(), value)
     }
 
+    pub fn take(&self, index: usize) -> Option<T> {
+        unsafe { self.values[index].replace(None) }
+    }
+
     pub fn try_get(&self, index: usize) -> Option<Ref<T>> {
         let slot = &self.values[index];
 
@@ -114,6 +118,8 @@ impl<T> Generational<T> {
         if let Some((gen, value)) = value {
             self.gen.set(gen.get());
             self.get().write(value);
+        } else {
+            self.gen.set(0);
         }
 
         old

@@ -1,3 +1,5 @@
+use std::iter;
+
 use bees::{Allocation, Struct};
 
 #[derive(Struct)]
@@ -42,6 +44,19 @@ impl<T> LinkedListRef<T> {
         self.set_left(None);
         self.set_right(None);
     }
+
+    pub fn iter_right(self) -> impl Iterator<Item = LinkedListRef<T>> {
+        let mut curr = Some(self);
+
+        iter::from_fn(move || {
+            if let Some(yielded) = curr {
+                curr = yielded.right();
+                Some(yielded)
+            } else {
+                None
+            }
+        })
+    }
 }
 
 fn main() {
@@ -75,4 +90,12 @@ fn main() {
 
     elem_2.wrap().insert_after(elem_1.wrap());
     elem_3.wrap().insert_after(elem_2.wrap());
+
+    for (i, elem) in elem_1.wrap().iter_right().enumerate() {
+        println!("{i}: {}", elem.value());
+    }
+
+    assert!(elem_1.is_alive());
+    alloc.take(0);
+    assert!(!elem_1.is_alive());
 }
