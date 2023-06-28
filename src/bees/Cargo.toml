@@ -4,4 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+beap = { git = "https://github.com/Radbuglet/beap.git", rev = "e0ac59d480d27e23dd0444c306926fe295b33e66" }
 bees-macro = { path = "../bees-macro" }
+derive-where = "1.2.1"
+hashbrown = "0.14.0"
